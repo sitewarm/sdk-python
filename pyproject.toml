@@ -1,0 +1,43 @@
+[build-system]
+requires = ["hatchling==1.27.0"]
+build-backend = "hatchling.build"
+
+[project]
+name = "sitewarm"
+version = "0.1.0"
+description = "Python client for the sitewarm API (pre-release)"
+readme = "README.md"
+license = "Apache-2.0"
+license-files = ["LICENSE"]
+requires-python = ">=3.10"
+dependencies = ["httpx>=0.27,<1", "pydantic>=2.6,<3"]
+classifiers = [
+  # Blocks accidental uploads to PyPI until a release is decided.
+  "Private :: Do Not Upload",
+  "Typing :: Typed",
+]
+
+[project.urls]
+Homepage = "https://github.com/sitewarm/sdk-python"
+Issues = "https://github.com/sitewarm/sdk-python/issues"
+
+[dependency-groups]
+dev = [
+  "datamodel-code-generator==0.86.0",
+  "pytest>=8",
+  "pytest-asyncio>=0.24",
+  "pyyaml>=6",
+  "mypy>=1.10",
+  "types-PyYAML",
+]
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/sitewarm"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+asyncio_mode = "auto"
+
+[tool.mypy]
+strict = true
+files = ["src/sitewarm/_client.py", "src/sitewarm/_errors.py", "src/sitewarm/_retry.py"]
