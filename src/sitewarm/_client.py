@@ -5,7 +5,7 @@ import json
 import re
 import time
 import uuid
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any, AsyncIterator, Iterator, Mapping, Optional, Union
 from urllib.parse import quote, urlencode, urlsplit
 
@@ -14,6 +14,7 @@ import httpx
 from ._errors import (
     SiteWarmConnectionError,
     SiteWarmError,
+    SiteWarmResponseTooLargeError,
     SiteWarmTimeoutError,
     SiteWarmWaitTimeoutError,
     api_error_for,
@@ -23,6 +24,35 @@ from ._retry import backoff_delay, parse_retry_after
 
 _LOOPBACK = {"localhost", "127.0.0.1", "::1"}
 _TERMINAL = {"completed", "canceled", "failed"}
+_MAX_BODY = 32 << 20  # largest response body that is read (32 MiB)
+_REPEATABLE = {"GET", "HEAD", "PUT", "OPTIONS"}
+_MAX_PAGES = 10_000
+
+
+class _Secret:
+    """Holds the API key so that repr/str/vars/pickle of the client never reveal it."""
+
+    __slots__ = ("_v",)
+
+    def __init__(self, v: str) -> None:
+        self._v = v
+
+    def reveal(self) -> str:
+        return self._v
+
+    def __repr__(self) -> str:
+        return "<redacted>"
+
+    __str__ = __repr__
+
+    def __reduce__(self) -> Any:
+        raise TypeError("the API key cannot be pickled")
+
+    def __copy__(self) -> "_Secret":
+        return self
+
+    def __deepcopy__(self, memo: Any) -> "_Secret":
+        return self
 
 
 @dataclass(frozen=True)
@@ -36,10 +66,10 @@ class ApiResponse:
 class _Prepared:
     method: str
     url: str
-    headers: dict[str, str]
-    content: Optional[bytes]
-    # 429 means "not processed". 5xx and network errors may have been, so they are only retried when
-    # repeating is safe: not a POST, or a POST carrying an Idempotency-Key.
+    headers: dict[str, str] = field(repr=False)  # carries Authorization
+    content: Optional[bytes] = field(repr=False)
+    # 429 means "not processed". 5xx, network errors and broken bodies may have been, so they are only retried
+    # when repeating is safe: GET, HEAD, PUT, OPTIONS, or a POST carrying an Idempotency-Key. Never DELETE/PATCH.
     retry_ambiguous: bool
 
 
@@ -58,12 +88,13 @@ class _Core:
         # Messages below never echo the key.
         if not isinstance(api_key, str) or not re.fullmatch(r"[\x21-\x7e]+", api_key):
             raise SiteWarmError("api_key must be a non-empty string without whitespace or control characters")
-        self._api_key = api_key
+        self._api_key = _Secret(api_key)
         self._base_url = _normalize_base_url(base_url)
-        self._max_retries = max_retries
+        # A negative max_retries or a timeout <= 0 keeps the default.
+        self._max_retries = int(max_retries) if _is_num(max_retries) and max_retries >= 0 else 3
         self._retry_base = retry_base_delay
         self._retry_max = max_retry_delay
-        self._timeout = timeout
+        self._timeout = float(timeout) if _is_num(timeout) and timeout > 0 else 30.0
         self._user_agent = user_agent or "sitewarm-python"
 
     def __repr__(self) -> str:  # the key is never part of repr or str
@@ -81,9 +112,9 @@ class _Core:
             op = OPERATIONS[operation_id]
         except KeyError:
             raise SiteWarmError(f"unknown operation {operation_id!r}") from None
-        url = self._base_url + _expand_path(op.path, path) + _query_string(query)
+        url = self._base_url + _expand_path(op.path, path) + _query_string(_checked_query(query))
         headers = {
-            "Authorization": f"Bearer {self._api_key}",
+            "Authorization": f"Bearer {self._api_key.reveal()}",
             "Accept": "application/json, application/problem+json",
             "User-Agent": self._user_agent,
         }
@@ -97,7 +128,7 @@ class _Core:
         if sends_key:
             # One key per call, reused by every retry, so a retried POST never starts a second run.
             headers["Idempotency-Key"] = idempotency_key or str(uuid.uuid4())
-        return _Prepared(op.method, url, headers, content, op.method != "POST" or sends_key)
+        return _Prepared(op.method, url, headers, content, op.method in _REPEATABLE or sends_key)
 
     def _decide(self, resp: httpx.Response, attempt: int, p: _Prepared) -> Union[ApiResponse, float]:
         """Returns the response to hand back, or the seconds to wait before retrying. Raises on errors."""
@@ -113,8 +144,9 @@ class _Core:
                 return float(wait)
         raise api_error_for(status, _parse_problem(resp), retry_after, _rate_limit(resp.headers))
 
-    def _transport_error(self, err: Exception, attempt: int, p: _Prepared) -> float:
-        if attempt < self._max_retries and p.retry_ambiguous:
+    def _transport_error(self, err: Exception, attempt: int, p: _Prepared, status: Optional[int] = None) -> float:
+        # status is set when the failure happened while reading the body: after a 429 nothing was processed.
+        if attempt < self._max_retries and (p.retry_ambiguous or status == 429):
             return backoff_delay(attempt, self._retry_base, self._retry_max)
         if isinstance(err, httpx.TimeoutException):
             raise SiteWarmTimeoutError(f"request timed out after {self._timeout} s") from err
@@ -157,10 +189,15 @@ class SiteWarm(_Core):
         p = self._prepare(operation_id, path, query, body, idempotency_key)
         attempt = 0
         while True:
+            status: list[int] = []
             try:
-                resp = self._http.request(p.method, p.url, headers=p.headers, content=p.content, timeout=self._timeout)
+                # follow_redirects=False even for a caller-supplied client, so Authorization never leaves the origin.
+                with self._http.stream(p.method, p.url, headers=p.headers, content=p.content, timeout=self._timeout,
+                                       follow_redirects=False) as raw:
+                    status.append(raw.status_code)
+                    resp = _bounded(raw)
             except httpx.HTTPError as err:
-                time.sleep(self._transport_error(err, attempt, p))
+                time.sleep(self._transport_error(err, attempt, p, status[0] if status else None))
                 attempt += 1
                 continue
             out = self._decide(resp, attempt, p)
@@ -169,10 +206,14 @@ class SiteWarm(_Core):
             time.sleep(out)
             attempt += 1
 
-    def pages(self, operation_id: str, *, max_pages: int = 10_000, **args: Any) -> Iterator[Any]:
-        """Yields the pages (``{"data": [...], "page": {...}}``) of a list operation."""
+    def pages(self, operation_id: str, *, max_pages: int = _MAX_PAGES, **args: Any) -> Iterator[Any]:
+        """Yields the pages (``{"data": [...], "page": {...}}``) of a list operation.
+
+        Raises if a cursor repeats or if ``max_pages`` (10,000) pages did not reach the end.
+        """
         query = dict(args.pop("query", None) or {})
         cursor = query.get("cursor")
+        seen = {cursor} if cursor else set()
         for _ in range(max_pages):
             if cursor:
                 query["cursor"] = cursor
@@ -181,9 +222,11 @@ class SiteWarm(_Core):
             nxt = page["page"].get("next_cursor")
             if not page["page"].get("has_more") or not nxt:
                 return
-            if nxt == cursor:
+            if nxt in seen:
                 raise SiteWarmError("pagination cursor did not advance")
+            seen.add(nxt)
             cursor = nxt
+        raise SiteWarmError(f"pagination stopped after {max_pages} pages without reaching the end")
 
     def paginate(self, operation_id: str, **args: Any) -> Iterator[Any]:
         """Yields every item of a list operation across pages."""
@@ -218,10 +261,14 @@ class AsyncSiteWarm(_Core):
         p = self._prepare(operation_id, path, query, body, idempotency_key)
         attempt = 0
         while True:
+            status: list[int] = []
             try:
-                resp = await self._http.request(p.method, p.url, headers=p.headers, content=p.content, timeout=self._timeout)
+                async with self._http.stream(p.method, p.url, headers=p.headers, content=p.content,
+                                             timeout=self._timeout, follow_redirects=False) as raw:
+                    status.append(raw.status_code)
+                    resp = await _abounded(raw)
             except httpx.HTTPError as err:
-                await asyncio.sleep(self._transport_error(err, attempt, p))
+                await asyncio.sleep(self._transport_error(err, attempt, p, status[0] if status else None))
                 attempt += 1
                 continue
             out = self._decide(resp, attempt, p)
@@ -230,9 +277,10 @@ class AsyncSiteWarm(_Core):
             await asyncio.sleep(out)
             attempt += 1
 
-    async def pages(self, operation_id: str, *, max_pages: int = 10_000, **args: Any) -> AsyncIterator[Any]:
+    async def pages(self, operation_id: str, *, max_pages: int = _MAX_PAGES, **args: Any) -> AsyncIterator[Any]:
         query = dict(args.pop("query", None) or {})
         cursor = query.get("cursor")
+        seen = {cursor} if cursor else set()
         for _ in range(max_pages):
             if cursor:
                 query["cursor"] = cursor
@@ -241,9 +289,11 @@ class AsyncSiteWarm(_Core):
             nxt = page["page"].get("next_cursor")
             if not page["page"].get("has_more") or not nxt:
                 return
-            if nxt == cursor:
+            if nxt in seen:
                 raise SiteWarmError("pagination cursor did not advance")
+            seen.add(nxt)
             cursor = nxt
+        raise SiteWarmError(f"pagination stopped after {max_pages} pages without reaching the end")
 
     async def paginate(self, operation_id: str, **args: Any) -> AsyncIterator[Any]:
         async for page in self.pages(operation_id, **args):
@@ -379,6 +429,47 @@ def _query_string(query: Optional[Mapping[str, Any]]) -> str:
         return ""
     pairs: list[tuple[str, str]] = [(k, str(v).lower() if isinstance(v, bool) else str(v)) for k, v in query.items() if v is not None]
     return "?" + urlencode(pairs) if pairs else ""
+
+
+def _is_num(v: Any) -> bool:
+    return isinstance(v, (int, float)) and not isinstance(v, bool)
+
+
+def _checked_query(query: Optional[Mapping[str, Any]]) -> Optional[Mapping[str, Any]]:
+    """``limit`` must be 1..100 (0 or None = server default, not sent); invalid values never reach the server."""
+    if not query or "limit" not in query:
+        return query
+    limit = query["limit"]
+    if limit is None or (isinstance(limit, int) and not isinstance(limit, bool) and limit == 0):
+        return {k: v for k, v in query.items() if k != "limit"}
+    if not isinstance(limit, int) or isinstance(limit, bool) or not 1 <= limit <= 100:
+        raise SiteWarmError("limit must be between 1 and 100")
+    return query
+
+
+def _rebuild(raw: httpx.Response, data: bytes) -> httpx.Response:
+    # iter_bytes() already decoded the body, so the copy must not claim an encoding or a length.
+    headers = [(k, v) for k, v in raw.headers.multi_items() if k.lower() not in ("content-encoding", "content-length")]
+    return httpx.Response(raw.status_code, headers=headers, content=data, request=raw.request)
+
+
+def _bounded(raw: httpx.Response) -> httpx.Response:
+    """Reads at most _MAX_BODY + 1 bytes; a larger body raises SiteWarmResponseTooLargeError (not retried)."""
+    buf = bytearray()
+    for chunk in raw.iter_bytes():
+        buf += chunk
+        if len(buf) > _MAX_BODY:
+            raise SiteWarmResponseTooLargeError(_MAX_BODY)
+    return _rebuild(raw, bytes(buf))
+
+
+async def _abounded(raw: httpx.Response) -> httpx.Response:
+    buf = bytearray()
+    async for chunk in raw.aiter_bytes():
+        buf += chunk
+        if len(buf) > _MAX_BODY:
+            raise SiteWarmResponseTooLargeError(_MAX_BODY)
+    return _rebuild(raw, bytes(buf))
 
 
 def _parse_body(resp: httpx.Response) -> Any:

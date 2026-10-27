@@ -16,6 +16,14 @@ class SiteWarmTimeoutError(SiteWarmConnectionError):
     """The per-request timeout elapsed."""
 
 
+class SiteWarmResponseTooLargeError(SiteWarmError):
+    """The response body was larger than the SDK reads (32 MiB). Not retried."""
+
+    def __init__(self, limit: int) -> None:
+        super().__init__(f"response body is larger than {limit} bytes")
+        self.limit = limit
+
+
 class SiteWarmApiError(SiteWarmError):
     """The API answered with a non-2xx status.
 
