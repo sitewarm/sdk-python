@@ -1,0 +1,2713 @@
+openapi: 3.1.0
+info:
+  title: sitewarm public API
+  version: 0.1.0
+  summary: Manage sites, warm runs, schedules, webhooks and API keys of the hosted sitewarm service.
+  description: |
+    This document is the source of truth for the public REST API; the server, the SDKs and the contract
+    tests are built from it.
+
+    ## Vocabulary
+
+    A **site** is one hostname. A **vantage
+    point** is the place a run's requests are sent from (`region` is an attribute of it). The
+    **cache status** of a URL is one of the normalized states in `CacheState`; `GET` results also carry
+    the raw CDN header value untouched in `cdn_cache_header`. Indexability is a separate field, never a
+    cache state.
+
+    ## Conventions
+
+    - **Versioning.** The base path is `/v1`. Breaking changes need a new major path.
+    - **Authentication.** Every operation takes a scoped API key as a bearer token
+      (`Authorization: Bearer <key>`). Session cookies are never accepted. Each operation lists the
+      scope it needs. A request for a resource of another organization returns `404`, not `403`.
+    - **Idempotency.** Send `Idempotency-Key` on `POST`. Repeating a request with the same key and the
+      same body returns the first response and sets `Idempotent-Replayed: true`. The same key with a
+      different body is a `409` problem of type `idempotency-key-reused`. The warm-run trigger requires
+      the header; the other `POST` operations accept it.
+    - **Pagination.** Lists use opaque cursors: pass `cursor` from `page.next_cursor` of the previous
+      page. Clients must not parse cursors.
+    - **Errors.** Every error is `application/problem+json` as in RFC 9457. The `type` member is a URI
+      reference naming one of the problem types listed in `ProblemType`.
+    - **Rate limits.** Every response except `500` carries `RateLimit-Limit`, `RateLimit-Remaining` and
+      `RateLimit-Reset`. A `429` also carries `Retry-After`.
+    - **Async work.** Starting a warm run answers `202 Accepted` with a `Location` header pointing at
+      the warm-run resource, which is the status resource to poll. Cancelling is also asynchronous.
+    - **Webhooks.** Events are delivered with an HMAC-SHA256 signature, see the `webhooks` section.
+    - **Time and ids.** Timestamps are RFC 3339 UTC. Ids are opaque strings. Durations are strings
+      such as `10s` or `5m`, as in the CLI.
+    - **Sensitive data.** The API never returns `Cookie`, `Set-Cookie` or `Authorization` values from a
+      customer site, and never accepts them. Header names such as `Cache-Control`, `Age` and `Vary`
+      are returned as observed.
+    - **Safety.** A site must be verified before any run. Triggering a run for an unverified
+      or paused site is rejected with a problem.
+  contact:
+    name: sitewarm
+    url: https://github.com/sitewarm
+  license:
+    name: Apache-2.0
+    identifier: Apache-2.0
+servers:
+  - url: /api/v1
+    description: |
+      Relative to the host that serves the API.
+
+tags:
+  - name: Sites
+    description: Hostnames the organization owns, and their sitemaps and URL sets.
+  - name: Warm runs
+    description: Warm and verify runs, their status and their results.
+  - name: Cache status reports
+    description: Cache status per route group and vantage point, derived from warm runs.
+  - name: Schedules
+    description: Recurring warm runs.
+  - name: Webhooks
+    description: Outbound event subscriptions signed with HMAC.
+  - name: API keys
+    description: Scoped credentials for this API.
+security:
+  - ApiKey: []
+paths:
+  /sites:
+    get:
+      operationId: listSites
+      summary: List sites
+      tags: [Sites]
+      security:
+        - ApiKey: [sites:read]
+      parameters:
+        - $ref: '#/components/parameters/Cursor'
+        - $ref: '#/components/parameters/Limit'
+      responses:
+        '200':
+          description: A page of sites.
+          headers:
+            RateLimit-Limit:
+              $ref: '#/components/headers/RateLimit-Limit'
+            RateLimit-Remaining:
+              $ref: '#/components/headers/RateLimit-Remaining'
+            RateLimit-Reset:
+              $ref: '#/components/headers/RateLimit-Reset'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SiteList'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '429':
+          $ref: '#/components/responses/TooManyRequests'
+        '500':
+          $ref: '#/components/responses/InternalError'
+    post:
+      operationId: createSite
+      summary: Create a site
+      description: |
+        Creates an unverified site. Verification is done outside this API; until it passes, runs for
+        the site are rejected (`site-not-verified`). A site is one hostname: the apex and its `www` are
+        the same site.
+      tags: [Sites]
+      security:
+        - ApiKey: [sites:write]
+      parameters:
+        - $ref: '#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/SiteCreate'
+      responses:
+        '201':
+          description: The site was created.
+          headers:
+            RateLimit-Limit:
+              $ref: '#/components/headers/RateLimit-Limit'
+            RateLimit-Remaining:
+              $ref: '#/components/headers/RateLimit-Remaining'
+            RateLimit-Reset:
+              $ref: '#/components/headers/RateLimit-Reset'
+            Location:
+              $ref: '#/components/headers/Location'
+            Idempotent-Replayed:
+              $ref: '#/components/headers/IdempotentReplayed'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Site'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '409':
+          $ref: '#/components/responses/Conflict'
+        '422':
+          $ref: '#/components/responses/Unprocessable'
+        '429':
+          $ref: '#/components/responses/TooManyRequests'
+        '500':
+          $ref: '#/components/responses/InternalError'
+  /sites/{siteId}:
+    parameters:
+      - $ref: '#/components/parameters/SiteId'
+    get:
+      operationId: getSite
+      summary: Get a site
+      tags: [Sites]
+      security:
+        - ApiKey: [sites:read]
+      responses:
+        '200':
+          description: The site.
+          headers:
+            RateLimit-Limit:
+              $ref: '#/components/headers/RateLimit-Limit'
+            RateLimit-Remaining:
+              $ref: '#/components/headers/RateLimit-Remaining'
+            RateLimit-Reset:
+              $ref: '#/components/headers/RateLimit-Reset'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Site'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '429':
+          $ref: '#/components/responses/TooManyRequests'
+        '500':
+          $ref: '#/components/responses/InternalError'
+    patch:
+      operationId: updateSite
+      summary: Update site settings
+      tags: [Sites]
+      security:
+        - ApiKey: [sites:write]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/SiteUpdate'
+      responses:
+        '200':
+          description: The updated site.
+          headers:
+            RateLimit-Limit:
+              $ref: '#/components/headers/RateLimit-Limit'
+            RateLimit-Remaining:
+              $ref: '#/components/headers/RateLimit-Remaining'
+            RateLimit-Reset:
+              $ref: '#/components/headers/RateLimit-Reset'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Site'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '422':
+          $ref: '#/components/responses/Unprocessable'
+        '429':
+          $ref: '#/components/responses/TooManyRequests'
+        '500':
+          $ref: '#/components/responses/InternalError'
+    delete:
+      operationId: deleteSite
+      summary: Delete a site and its history
+      description: Deletes the site, its sitemaps, URL sets, schedules and stored results.
+      tags: [Sites]
+      security:
+        - ApiKey: [sites:write]
+      responses:
+        '204':
+          description: The site was deleted.
+          headers:
+            RateLimit-Limit:
+              $ref: '#/components/headers/RateLimit-Limit'
+            RateLimit-Remaining:
+              $ref: '#/components/headers/RateLimit-Remaining'
+            RateLimit-Reset:
+              $ref: '#/components/headers/RateLimit-Reset'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '429':
+          $ref: '#/components/responses/TooManyRequests'
+        '500':
+          $ref: '#/components/responses/InternalError'
+  /sites/{siteId}/sitemaps:
+    parameters:
+      - $ref: '#/components/parameters/SiteId'
+    get:
+      operationId: listSitemaps
+      summary: List the sitemaps of a site
+      tags: [Sites]
+      security:
+        - ApiKey: [sites:read]
+      parameters:
+        - $ref: '#/components/parameters/Cursor'
+        - $ref: '#/components/parameters/Limit'
+      responses:
+        '200':
+          description: A page of sitemaps.
+          headers:
+            RateLimit-Limit:
+              $ref: '#/components/headers/RateLimit-Limit'
+            RateLimit-Remaining:
+              $ref: '#/components/headers/RateLimit-Remaining'
+            RateLimit-Reset:
+              $ref: '#/components/headers/RateLimit-Reset'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SitemapList'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '429':
+          $ref: '#/components/responses/TooManyRequests'
+        '500':
+          $ref: '#/components/responses/InternalError'
+    post:
+      operationId: createSitemap
+      summary: Register a sitemap
+      description: The sitemap URL must be on the site's hostname. Sitemap indexes and `.gz` files are accepted.
+      tags: [Sites]
+      security:
+        - ApiKey: [sites:write]
+      parameters:
+        - $ref: '#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/SitemapCreate'
+      responses:
+        '201':
+          description: The sitemap was registered.
+          headers:
+            RateLimit-Limit:
+              $ref: '#/components/headers/RateLimit-Limit'
+            RateLimit-Remaining:
+              $ref: '#/components/headers/RateLimit-Remaining'
+            RateLimit-Reset:
+              $ref: '#/components/headers/RateLimit-Reset'
+            Location:
+              $ref: '#/components/headers/Location'
+            Idempotent-Replayed:
+              $ref: '#/components/headers/IdempotentReplayed'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Sitemap'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/Conflict'
+        '422':
+          $ref: '#/components/responses/Unprocessable'
+        '429':
+          $ref: '#/components/responses/TooManyRequests'
+        '500':
+          $ref: '#/components/responses/InternalError'
+  /sites/{siteId}/sitemaps/{sitemapId}:
+    parameters:
+      - $ref: '#/components/parameters/SiteId'
+      - $ref: '#/components/parameters/SitemapId'
+    get:
+      operationId: getSitemap
+      summary: Get a sitemap
+      tags: [Sites]
+      security:
+        - ApiKey: [sites:read]
+      responses:
+        '200':
+          description: The sitemap.
+          headers:
+            RateLimit-Limit:
+              $ref: '#/components/headers/RateLimit-Limit'
+            RateLimit-Remaining:
+              $ref: '#/components/headers/RateLimit-Remaining'
+            RateLimit-Reset:
+              $ref: '#/components/headers/RateLimit-Reset'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Sitemap'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '429':
+          $ref: '#/components/responses/TooManyRequests'
+        '500':
+          $ref: '#/components/responses/InternalError'
+    delete:
+      operationId: deleteSitemap
+      summary: Remove a sitemap
+      tags: [Sites]
+      security:
+        - ApiKey: [sites:write]
+      responses:
+        '204':
+          description: The sitemap was removed.
+          headers:
+            RateLimit-Limit:
+              $ref: '#/components/headers/RateLimit-Limit'
+            RateLimit-Remaining:
+              $ref: '#/components/headers/RateLimit-Remaining'
+            RateLimit-Reset:
+              $ref: '#/components/headers/RateLimit-Reset'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/Conflict'
+        '429':
+          $ref: '#/components/responses/TooManyRequests'
+        '500':
+          $ref: '#/components/responses/InternalError'
+  /sites/{siteId}/url-sets:
+    parameters:
+      - $ref: '#/components/parameters/SiteId'
+    get:
+      operationId: listUrlSets
+      summary: List the URL sets of a site
+      description: |
+        A URL set is an explicit, ordered list of URLs, the hosted equivalent of the CLI's `--top-from`
+        file. The order is the warming priority.
+      tags: [Sites]
+      security:
+        - ApiKey: [sites:read]
+      parameters:
+        - $ref: '#/components/parameters/Cursor'
+        - $ref: '#/components/parameters/Limit'
+      responses:
+        '200':
+          description: A page of URL sets (without their URLs).
+          headers:
+            RateLimit-Limit:
+              $ref: '#/components/headers/RateLimit-Limit'
+            RateLimit-Remaining:
+              $ref: '#/components/headers/RateLimit-Remaining'
+            RateLimit-Reset:
+              $ref: '#/components/headers/RateLimit-Reset'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/UrlSetList'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '429':
+          $ref: '#/components/responses/TooManyRequests'
+        '500':
+          $ref: '#/components/responses/InternalError'
+    post:
+      operationId: createUrlSet
+      summary: Create a URL set
+      tags: [Sites]
+      security:
+        - ApiKey: [sites:write]
+      parameters:
+        - $ref: '#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/UrlSetWrite'
+      responses:
+        '201':
+          description: The URL set was created.
+          headers:
+            RateLimit-Limit:
+              $ref: '#/components/headers/RateLimit-Limit'
+            RateLimit-Remaining:
+              $ref: '#/components/headers/RateLimit-Remaining'
+            RateLimit-Reset:
+              $ref: '#/components/headers/RateLimit-Reset'
+            Location:
+              $ref: '#/components/headers/Location'
+            Idempotent-Replayed:
+              $ref: '#/components/headers/IdempotentReplayed'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/UrlSet'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/Conflict'
+        '422':
+          $ref: '#/components/responses/Unprocessable'
+        '429':
+          $ref: '#/components/responses/TooManyRequests'
+        '500':
+          $ref: '#/components/responses/InternalError'
+  /sites/{siteId}/url-sets/{urlSetId}:
+    parameters:
+      - $ref: '#/components/parameters/SiteId'
+      - $ref: '#/components/parameters/UrlSetId'
+    get:
+      operationId: getUrlSet
+      summary: Get a URL set with its URLs
+      tags: [Sites]
+      security:
+        - ApiKey: [sites:read]
+      responses:
+        '200':
+          description: The URL set.
+          headers:
+            RateLimit-Limit:
+              $ref: '#/components/headers/RateLimit-Limit'
+            RateLimit-Remaining:
+              $ref: '#/components/headers/RateLimit-Remaining'
+            RateLimit-Reset:
+              $ref: '#/components/headers/RateLimit-Reset'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/UrlSet'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '429':
+          $ref: '#/components/responses/TooManyRequests'
+        '500':
+          $ref: '#/components/responses/InternalError'
+    put:
+      operationId: replaceUrlSet
+      summary: Replace a URL set
+      tags: [Sites]
+      security:
+        - ApiKey: [sites:write]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/UrlSetWrite'
+      responses:
+        '200':
+          description: The replaced URL set.
+          headers:
+            RateLimit-Limit:
+              $ref: '#/components/headers/RateLimit-Limit'
+            RateLimit-Remaining:
+              $ref: '#/components/headers/RateLimit-Remaining'
+            RateLimit-Reset:
+              $ref: '#/components/headers/RateLimit-Reset'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/UrlSet'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '422':
+          $ref: '#/components/responses/Unprocessable'
+        '429':
+          $ref: '#/components/responses/TooManyRequests'
+        '500':
+          $ref: '#/components/responses/InternalError'
+    delete:
+      operationId: deleteUrlSet
+      summary: Delete a URL set
+      tags: [Sites]
+      security:
+        - ApiKey: [sites:write]
+      responses:
+        '204':
+          description: The URL set was deleted.
+          headers:
+            RateLimit-Limit:
+              $ref: '#/components/headers/RateLimit-Limit'
+            RateLimit-Remaining:
+              $ref: '#/components/headers/RateLimit-Remaining'
+            RateLimit-Reset:
+              $ref: '#/components/headers/RateLimit-Reset'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/Conflict'
+        '429':
+          $ref: '#/components/responses/TooManyRequests'
+        '500':
+          $ref: '#/components/responses/InternalError'
+  /sites/{siteId}/warm-runs:
+    parameters:
+      - $ref: '#/components/parameters/SiteId'
+    get:
+      operationId: listWarmRuns
+      summary: List warm runs of a site
+      tags: [Warm runs]
+      security:
+        - ApiKey: [warm-runs:read]
+      parameters:
+        - $ref: '#/components/parameters/Cursor'
+        - $ref: '#/components/parameters/Limit'
+        - name: status
+          in: query
+          description: Only runs in this lifecycle status.
+          schema:
+            $ref: '#/components/schemas/RunStatus'
+        - name: trigger_type
+          in: query
+          description: Only runs started this way.
+          schema:
+            $ref: '#/components/schemas/TriggerType'
+      responses:
+        '200':
+          description: A page of warm runs, newest first.
+          headers:
+            RateLimit-Limit:
+              $ref: '#/components/headers/RateLimit-Limit'
+            RateLimit-Remaining:
+              $ref: '#/components/headers/RateLimit-Remaining'
+            RateLimit-Reset:
+              $ref: '#/components/headers/RateLimit-Reset'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/WarmRunList'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '429':
+          $ref: '#/components/responses/TooManyRequests'
+        '500':
+          $ref: '#/components/responses/InternalError'
+    post:
+      operationId: createWarmRun
+      summary: Start a warm run (for example after a deploy)
+      description: |
+        Queues a run that warms and verifies the URLs of one source, from the vantage points the
+        organization is entitled to, and answers `202`. Poll `GET /warm-runs/{runId}` (the `Location`
+        header) until `status` is `completed` or `canceled`, then read `outcome` and the results.
+
+        The run is rejected if the site is not verified (`site-not-verified`), is paused (`site-paused`),
+        or the organization is over a limit (`quota-exceeded`).
+
+        `source` may be omitted: the run then warms the URLs of the site's discovered sitemaps
+        (`robots.txt` and `/sitemap.xml`). In the current implementation `source` of type `sitemap` or
+        `url_set`, `vantage_point_ids` and every option other than `top` and `fail_on` answer `422`
+        (`validation-failed`) with a JSON Pointer; they are never ignored silently. Only one run per
+        site may be queued or running (`conflict`).
+
+        `Idempotency-Key` is required: a retried trigger from CI must not start a second run.
+
+      tags: [Warm runs]
+      security:
+        - ApiKey: [warm-runs:write]
+      parameters:
+        - $ref: '#/components/parameters/IdempotencyKeyRequired'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/WarmRunCreate'
+            examples:
+              afterDeploy:
+                summary: Warm the sitemap after a production deploy
+                value:
+                  source:
+                    type: sitemap
+                    sitemap_id: sm_example
+                  deployment:
+                    id: deploy-1234
+                    environment: production
+                    ref: 0123abcd
+                  options:
+                    fail_on: [miss, error, noindex]
+      responses:
+        '202':
+          description: The run was accepted and queued.
+          headers:
+            RateLimit-Limit:
+              $ref: '#/components/headers/RateLimit-Limit'
+            RateLimit-Remaining:
+              $ref: '#/components/headers/RateLimit-Remaining'
+            RateLimit-Reset:
+              $ref: '#/components/headers/RateLimit-Reset'
+            Location:
+              $ref: '#/components/headers/Location'
+            Retry-After:
+              $ref: '#/components/headers/RetryAfter'
+            Idempotent-Replayed:
+              $ref: '#/components/headers/IdempotentReplayed'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/WarmRun'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/Conflict'
+        '422':
+          $ref: '#/components/responses/Unprocessable'
+        '429':
+          $ref: '#/components/responses/TooManyRequests'
+        '500':
+          $ref: '#/components/responses/InternalError'
+  /warm-runs/{runId}:
+    parameters:
+      - $ref: '#/components/parameters/RunId'
+    get:
+      operationId: getWarmRun
+      summary: Get a warm run (status resource)
+      description: |
+        While the run is `queued` or `running` the response carries `Retry-After` with the suggested
+        polling delay. `outcome` is null until the run is `completed`.
+      tags: [Warm runs]
+      security:
+        - ApiKey: [warm-runs:read]
+      responses:
+        '200':
+          description: The warm run, with a per-vantage-point summary.
+          headers:
+            RateLimit-Limit:
+              $ref: '#/components/headers/RateLimit-Limit'
+            RateLimit-Remaining:
+              $ref: '#/components/headers/RateLimit-Remaining'
+            RateLimit-Reset:
+              $ref: '#/components/headers/RateLimit-Reset'
+            Retry-After:
+              $ref: '#/components/headers/RetryAfter'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/WarmRun'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '429':
+          $ref: '#/components/responses/TooManyRequests'
+        '500':
+          $ref: '#/components/responses/InternalError'
+  /warm-runs/{runId}/cancel:
+    parameters:
+      - $ref: '#/components/parameters/RunId'
+    post:
+      operationId: cancelWarmRun
+      summary: Cancel a warm run
+      description: |
+        Asks the vantage points to stop. URLs not requested yet are recorded as `incomplete`. Answers
+        `202`; the run becomes `canceled` once every vantage point has stopped. Cancelling a run that is
+        already `completed` or `canceled` is a no-op that returns `202` with the current state.
+      tags: [Warm runs]
+      security:
+        - ApiKey: [warm-runs:write]
+      parameters:
+        - $ref: '#/components/parameters/IdempotencyKey'
+      responses:
+        '202':
+          description: Cancellation was requested.
+          headers:
+            RateLimit-Limit:
+              $ref: '#/components/headers/RateLimit-Limit'
+            RateLimit-Remaining:
+              $ref: '#/components/headers/RateLimit-Remaining'
+            RateLimit-Reset:
+              $ref: '#/components/headers/RateLimit-Reset'
+            Location:
+              $ref: '#/components/headers/Location'
+            Retry-After:
+              $ref: '#/components/headers/RetryAfter'
+            Idempotent-Replayed:
+              $ref: '#/components/headers/IdempotentReplayed'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/WarmRun'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '429':
+          $ref: '#/components/responses/TooManyRequests'
+        '500':
+          $ref: '#/components/responses/InternalError'
+  /warm-runs/{runId}/results:
+    parameters:
+      - $ref: '#/components/parameters/RunId'
+    get:
+      operationId: listWarmRunResults
+      summary: List per-URL results of a warm run
+      description: |
+        One result per URL, profile and vantage point. Results of a run that is still in progress are
+        partial and may change until the run is `completed`.
+      tags: [Warm runs]
+      security:
+        - ApiKey: [warm-runs:read]
+      parameters:
+        - $ref: '#/components/parameters/Cursor'
+        - $ref: '#/components/parameters/Limit'
+        - name: final_state
+          in: query
+          description: Only results whose final cache status is this state.
+          schema:
+            $ref: '#/components/schemas/CacheState'
+        - name: vantage_point_id
+          in: query
+          description: Only results observed from this vantage point.
+          schema:
+            type: string
+        - name: profile
+          in: query
+          description: Only results for this request profile (for example `desktop` or `mobile`).
+          schema:
+            type: string
+        - name: url
+          in: query
+          description: Only the results of this exact URL.
+          schema:
+            type: string
+            format: uri
+        - name: route_group
+          in: query
+          description: Only results in this route group.
+          schema:
+            type: string
+      responses:
+        '200':
+          description: A page of results.
+          headers:
+            RateLimit-Limit:
+              $ref: '#/components/headers/RateLimit-Limit'
+            RateLimit-Remaining:
+              $ref: '#/components/headers/RateLimit-Remaining'
+            RateLimit-Reset:
+              $ref: '#/components/headers/RateLimit-Reset'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ResultList'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '429':
+          $ref: '#/components/responses/TooManyRequests'
+        '500':
+          $ref: '#/components/responses/InternalError'
+  /sites/{siteId}/cache-status-reports:
+    parameters:
+      - $ref: '#/components/parameters/SiteId'
+    get:
+      operationId: listCacheStatusReports
+      summary: List cache status reports of a site
+      description: One report per completed warm run, newest first.
+      tags: [Cache status reports]
+      security:
+        - ApiKey: [cache-reports:read]
+      parameters:
+        - $ref: '#/components/parameters/Cursor'
+        - $ref: '#/components/parameters/Limit'
+        - name: warm_run_id
+          in: query
+          description: Only the report of this warm run.
+          schema:
+            type: string
+      responses:
+        '200':
+          description: A page of report summaries (without cells).
+          headers:
+            RateLimit-Limit:
+              $ref: '#/components/headers/RateLimit-Limit'
+            RateLimit-Remaining:
+              $ref: '#/components/headers/RateLimit-Remaining'
+            RateLimit-Reset:
+              $ref: '#/components/headers/RateLimit-Reset'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/CacheStatusReportList'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '429':
+          $ref: '#/components/responses/TooManyRequests'
+        '500':
+          $ref: '#/components/responses/InternalError'
+  /cache-status-reports/{reportId}:
+    parameters:
+      - $ref: '#/components/parameters/ReportId'
+    get:
+      operationId: getCacheStatusReport
+      summary: Get a cache status report
+      tags: [Cache status reports]
+      security:
+        - ApiKey: [cache-reports:read]
+      responses:
+        '200':
+          description: The report, with one cell per route group and vantage point.
+          headers:
+            RateLimit-Limit:
+              $ref: '#/components/headers/RateLimit-Limit'
+            RateLimit-Remaining:
+              $ref: '#/components/headers/RateLimit-Remaining'
+            RateLimit-Reset:
+              $ref: '#/components/headers/RateLimit-Reset'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/CacheStatusReport'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '429':
+          $ref: '#/components/responses/TooManyRequests'
+        '500':
+          $ref: '#/components/responses/InternalError'
+  /sites/{siteId}/schedules:
+    parameters:
+      - $ref: '#/components/parameters/SiteId'
+    get:
+      operationId: listSchedules
+      summary: List schedules of a site
+      tags: [Schedules]
+      security:
+        - ApiKey: [schedules:read]
+      parameters:
+        - $ref: '#/components/parameters/Cursor'
+        - $ref: '#/components/parameters/Limit'
+      responses:
+        '200':
+          description: A page of schedules.
+          headers:
+            RateLimit-Limit:
+              $ref: '#/components/headers/RateLimit-Limit'
+            RateLimit-Remaining:
+              $ref: '#/components/headers/RateLimit-Remaining'
+            RateLimit-Reset:
+              $ref: '#/components/headers/RateLimit-Reset'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ScheduleList'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '429':
+          $ref: '#/components/responses/TooManyRequests'
+        '500':
+          $ref: '#/components/responses/InternalError'
+    post:
+      operationId: createSchedule
+      summary: Create a schedule
+      description: The cadence is validated against the organization's limits (`quota-exceeded`).
+      tags: [Schedules]
+      security:
+        - ApiKey: [schedules:write]
+      parameters:
+        - $ref: '#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/ScheduleCreate'
+      responses:
+        '201':
+          description: The schedule was created.
+          headers:
+            RateLimit-Limit:
+              $ref: '#/components/headers/RateLimit-Limit'
+            RateLimit-Remaining:
+              $ref: '#/components/headers/RateLimit-Remaining'
+            RateLimit-Reset:
+              $ref: '#/components/headers/RateLimit-Reset'
+            Location:
+              $ref: '#/components/headers/Location'
+            Idempotent-Replayed:
+              $ref: '#/components/headers/IdempotentReplayed'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Schedule'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/Conflict'
+        '422':
+          $ref: '#/components/responses/Unprocessable'
+        '429':
+          $ref: '#/components/responses/TooManyRequests'
+        '500':
+          $ref: '#/components/responses/InternalError'
+  /schedules/{scheduleId}:
+    parameters:
+      - $ref: '#/components/parameters/ScheduleId'
+    get:
+      operationId: getSchedule
+      summary: Get a schedule
+      tags: [Schedules]
+      security:
+        - ApiKey: [schedules:read]
+      responses:
+        '200':
+          description: The schedule.
+          headers:
+            RateLimit-Limit:
+              $ref: '#/components/headers/RateLimit-Limit'
+            RateLimit-Remaining:
+              $ref: '#/components/headers/RateLimit-Remaining'
+            RateLimit-Reset:
+              $ref: '#/components/headers/RateLimit-Reset'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Schedule'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '429':
+          $ref: '#/components/responses/TooManyRequests'
+        '500':
+          $ref: '#/components/responses/InternalError'
+    patch:
+      operationId: updateSchedule
+      summary: Update a schedule
+      tags: [Schedules]
+      security:
+        - ApiKey: [schedules:write]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/ScheduleUpdate'
+      responses:
+        '200':
+          description: The updated schedule.
+          headers:
+            RateLimit-Limit:
+              $ref: '#/components/headers/RateLimit-Limit'
+            RateLimit-Remaining:
+              $ref: '#/components/headers/RateLimit-Remaining'
+            RateLimit-Reset:
+              $ref: '#/components/headers/RateLimit-Reset'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Schedule'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '422':
+          $ref: '#/components/responses/Unprocessable'
+        '429':
+          $ref: '#/components/responses/TooManyRequests'
+        '500':
+          $ref: '#/components/responses/InternalError'
+    delete:
+      operationId: deleteSchedule
+      summary: Delete a schedule
+      tags: [Schedules]
+      security:
+        - ApiKey: [schedules:write]
+      responses:
+        '204':
+          description: The schedule was deleted. Runs already started are not affected.
+          headers:
+            RateLimit-Limit:
+              $ref: '#/components/headers/RateLimit-Limit'
+            RateLimit-Remaining:
+              $ref: '#/components/headers/RateLimit-Remaining'
+            RateLimit-Reset:
+              $ref: '#/components/headers/RateLimit-Reset'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '429':
+          $ref: '#/components/responses/TooManyRequests'
+        '500':
+          $ref: '#/components/responses/InternalError'
+  /webhooks:
+    get:
+      operationId: listWebhooks
+      summary: List webhook endpoints
+      tags: [Webhooks]
+      security:
+        - ApiKey: [webhooks:read]
+      parameters:
+        - $ref: '#/components/parameters/Cursor'
+        - $ref: '#/components/parameters/Limit'
+      responses:
+        '200':
+          description: A page of webhook endpoints (secrets are never listed).
+          headers:
+            RateLimit-Limit:
+              $ref: '#/components/headers/RateLimit-Limit'
+            RateLimit-Remaining:
+              $ref: '#/components/headers/RateLimit-Remaining'
+            RateLimit-Reset:
+              $ref: '#/components/headers/RateLimit-Reset'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/WebhookList'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '429':
+          $ref: '#/components/responses/TooManyRequests'
+        '500':
+          $ref: '#/components/responses/InternalError'
+    post:
+      operationId: createWebhook
+      summary: Create a webhook endpoint
+      description: |
+        The signing secret is returned once, in this response. Keep it: it cannot be read again, only
+        replaced with `rotateWebhookSecret`.
+      tags: [Webhooks]
+      security:
+        - ApiKey: [webhooks:write]
+      parameters:
+        - $ref: '#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/WebhookCreate'
+      responses:
+        '201':
+          description: The endpoint was created.
+          headers:
+            RateLimit-Limit:
+              $ref: '#/components/headers/RateLimit-Limit'
+            RateLimit-Remaining:
+              $ref: '#/components/headers/RateLimit-Remaining'
+            RateLimit-Reset:
+              $ref: '#/components/headers/RateLimit-Reset'
+            Location:
+              $ref: '#/components/headers/Location'
+            Idempotent-Replayed:
+              $ref: '#/components/headers/IdempotentReplayed'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/WebhookWithSecret'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '409':
+          $ref: '#/components/responses/Conflict'
+        '422':
+          $ref: '#/components/responses/Unprocessable'
+        '429':
+          $ref: '#/components/responses/TooManyRequests'
+        '500':
+          $ref: '#/components/responses/InternalError'
+  /webhooks/{webhookId}:
+    parameters:
+      - $ref: '#/components/parameters/WebhookId'
+    get:
+      operationId: getWebhook
+      summary: Get a webhook endpoint
+      tags: [Webhooks]
+      security:
+        - ApiKey: [webhooks:read]
+      responses:
+        '200':
+          description: The endpoint.
+          headers:
+            RateLimit-Limit:
+              $ref: '#/components/headers/RateLimit-Limit'
+            RateLimit-Remaining:
+              $ref: '#/components/headers/RateLimit-Remaining'
+            RateLimit-Reset:
+              $ref: '#/components/headers/RateLimit-Reset'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Webhook'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '429':
+          $ref: '#/components/responses/TooManyRequests'
+        '500':
+          $ref: '#/components/responses/InternalError'
+    patch:
+      operationId: updateWebhook
+      summary: Update a webhook endpoint
+      tags: [Webhooks]
+      security:
+        - ApiKey: [webhooks:write]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/WebhookUpdate'
+      responses:
+        '200':
+          description: The updated endpoint.
+          headers:
+            RateLimit-Limit:
+              $ref: '#/components/headers/RateLimit-Limit'
+            RateLimit-Remaining:
+              $ref: '#/components/headers/RateLimit-Remaining'
+            RateLimit-Reset:
+              $ref: '#/components/headers/RateLimit-Reset'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Webhook'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '422':
+          $ref: '#/components/responses/Unprocessable'
+        '429':
+          $ref: '#/components/responses/TooManyRequests'
+        '500':
+          $ref: '#/components/responses/InternalError'
+    delete:
+      operationId: deleteWebhook
+      summary: Delete a webhook endpoint
+      tags: [Webhooks]
+      security:
+        - ApiKey: [webhooks:write]
+      responses:
+        '204':
+          description: The endpoint was deleted.
+          headers:
+            RateLimit-Limit:
+              $ref: '#/components/headers/RateLimit-Limit'
+            RateLimit-Remaining:
+              $ref: '#/components/headers/RateLimit-Remaining'
+            RateLimit-Reset:
+              $ref: '#/components/headers/RateLimit-Reset'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '429':
+          $ref: '#/components/responses/TooManyRequests'
+        '500':
+          $ref: '#/components/responses/InternalError'
+  /webhooks/{webhookId}/rotate-secret:
+    parameters:
+      - $ref: '#/components/parameters/WebhookId'
+    post:
+      operationId: rotateWebhookSecret
+      summary: Replace the signing secret of a webhook endpoint
+      description: |
+        Returns the new secret once.
+      tags: [Webhooks]
+      security:
+        - ApiKey: [webhooks:write]
+      parameters:
+        - $ref: '#/components/parameters/IdempotencyKey'
+      responses:
+        '200':
+          description: The endpoint with its new secret.
+          headers:
+            RateLimit-Limit:
+              $ref: '#/components/headers/RateLimit-Limit'
+            RateLimit-Remaining:
+              $ref: '#/components/headers/RateLimit-Remaining'
+            RateLimit-Reset:
+              $ref: '#/components/headers/RateLimit-Reset'
+            Idempotent-Replayed:
+              $ref: '#/components/headers/IdempotentReplayed'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/WebhookWithSecret'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '429':
+          $ref: '#/components/responses/TooManyRequests'
+        '500':
+          $ref: '#/components/responses/InternalError'
+  /api-keys:
+    get:
+      operationId: listApiKeys
+      summary: List API keys
+      tags: [API keys]
+      security:
+        - ApiKey: [api-keys:read]
+      parameters:
+        - $ref: '#/components/parameters/Cursor'
+        - $ref: '#/components/parameters/Limit'
+      responses:
+        '200':
+          description: A page of API keys (secrets are never listed).
+          headers:
+            RateLimit-Limit:
+              $ref: '#/components/headers/RateLimit-Limit'
+            RateLimit-Remaining:
+              $ref: '#/components/headers/RateLimit-Remaining'
+            RateLimit-Reset:
+              $ref: '#/components/headers/RateLimit-Reset'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ApiKeyList'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '429':
+          $ref: '#/components/responses/TooManyRequests'
+        '500':
+          $ref: '#/components/responses/InternalError'
+    post:
+      operationId: createApiKey
+      summary: Create an API key
+      description: |
+        The key secret is returned once, in this response. The scopes of the new key must be a subset of
+        the scopes of the calling key (`scope-not-allowed` otherwise). If the calling key has an
+        `expires_at`, the new key must set `expires_at` no later than it (`scope-not-allowed` otherwise):
+        a key cannot mint a credential that outlives itself. The first key of an organization is created
+        in the panel, not through this API.
+      tags: [API keys]
+      security:
+        - ApiKey: [api-keys:write]
+      parameters:
+        - $ref: '#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/ApiKeyCreate'
+      responses:
+        '201':
+          description: The key was created.
+          headers:
+            RateLimit-Limit:
+              $ref: '#/components/headers/RateLimit-Limit'
+            RateLimit-Remaining:
+              $ref: '#/components/headers/RateLimit-Remaining'
+            RateLimit-Reset:
+              $ref: '#/components/headers/RateLimit-Reset'
+            Location:
+              $ref: '#/components/headers/Location'
+            Idempotent-Replayed:
+              $ref: '#/components/headers/IdempotentReplayed'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ApiKeyWithSecret'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '409':
+          $ref: '#/components/responses/Conflict'
+        '422':
+          $ref: '#/components/responses/Unprocessable'
+        '429':
+          $ref: '#/components/responses/TooManyRequests'
+        '500':
+          $ref: '#/components/responses/InternalError'
+  /api-keys/{apiKeyId}:
+    parameters:
+      - $ref: '#/components/parameters/ApiKeyId'
+    get:
+      operationId: getApiKey
+      summary: Get an API key
+      tags: [API keys]
+      security:
+        - ApiKey: [api-keys:read]
+      responses:
+        '200':
+          description: The key metadata.
+          headers:
+            RateLimit-Limit:
+              $ref: '#/components/headers/RateLimit-Limit'
+            RateLimit-Remaining:
+              $ref: '#/components/headers/RateLimit-Remaining'
+            RateLimit-Reset:
+              $ref: '#/components/headers/RateLimit-Reset'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ApiKey'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '429':
+          $ref: '#/components/responses/TooManyRequests'
+        '500':
+          $ref: '#/components/responses/InternalError'
+    delete:
+      operationId: revokeApiKey
+      summary: Revoke an API key
+      description: Revocation is immediate and permanent. A key can revoke itself.
+      tags: [API keys]
+      security:
+        - ApiKey: [api-keys:write]
+      responses:
+        '204':
+          description: The key was revoked.
+          headers:
+            RateLimit-Limit:
+              $ref: '#/components/headers/RateLimit-Limit'
+            RateLimit-Remaining:
+              $ref: '#/components/headers/RateLimit-Remaining'
+            RateLimit-Reset:
+              $ref: '#/components/headers/RateLimit-Reset'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '429':
+          $ref: '#/components/responses/TooManyRequests'
+        '500':
+          $ref: '#/components/responses/InternalError'
+webhooks:
+  warmRunCompleted:
+    post:
+      operationId: onWarmRunCompleted
+      summary: A warm run finished
+      description: |
+        Sent when a run becomes `completed`, with its `outcome`. Use it to gate a pipeline without
+        polling.
+
+        **Signature.** Each delivery carries `Sitewarm-Signature: t=<unix seconds>,v1=<hex>`, where
+        `<hex>` is HMAC-SHA256, keyed with the endpoint secret, over the string
+        `<t>.<raw request body>`. Verify it against the raw bytes, compare in constant time, and reject
+        a timestamp that is too old. A 2xx response acknowledges the delivery; other responses and
+        timeouts are retried.
+      tags: [Webhooks]
+      security: []
+      parameters:
+        - $ref: '#/components/parameters/SignatureHeader'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/WarmRunCompletedEvent'
+      responses:
+        '200':
+          description: Delivery acknowledged.
+  warmRunCanceled:
+    post:
+      operationId: onWarmRunCanceled
+      summary: A warm run was canceled
+      description: Sent when a run becomes `canceled`. Signed like every webhook delivery.
+      tags: [Webhooks]
+      security: []
+      parameters:
+        - $ref: '#/components/parameters/SignatureHeader'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/WarmRunCanceledEvent'
+      responses:
+        '200':
+          description: Delivery acknowledged.
+  siteVerificationChanged:
+    post:
+      operationId: onSiteVerificationChanged
+      summary: A site became verified or lost its verification
+      description: |
+        Sent when the verification status of a site changes. When a site stops being verified its jobs
+        are stopped. Signed like every webhook delivery.
+      tags: [Webhooks]
+      security: []
+      parameters:
+        - $ref: '#/components/parameters/SignatureHeader'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/SiteVerificationChangedEvent'
+      responses:
+        '200':
+          description: Delivery acknowledged.
+components:
+  securitySchemes:
+    ApiKey:
+      type: http
+      scheme: bearer
+      bearerFormat: sitewarm API key
+      description: |
+        A scoped API key sent as `Authorization: Bearer <key>`. Operations name the scope they need in
+        their `security` requirement. Session cookies are not accepted. Scopes:
+        `sites:read`, `sites:write`, `warm-runs:read`, `warm-runs:write`, `cache-reports:read`,
+        `schedules:read`, `schedules:write`, `webhooks:read`, `webhooks:write`, `api-keys:read`,
+        `api-keys:write`.
+  parameters:
+    Cursor:
+      name: cursor
+      in: query
+      description: Opaque cursor from `page.next_cursor` of the previous page. Omit for the first page.
+      schema:
+        type: string
+    Limit:
+      name: limit
+      in: query
+      description: |
+        Maximum number of items in the page. The server may return fewer. Default 20, maximum 100.
+
+      schema:
+        type: integer
+        minimum: 1
+        maximum: 100
+        default: 20
+    IdempotencyKey:
+      name: Idempotency-Key
+      in: header
+      required: false
+      description: |
+        Client-chosen unique value for this request (a random UUID is a good choice). A retry with the
+        same key and body returns the first response.
+      schema:
+        type: string
+        minLength: 1
+        maxLength: 255
+    IdempotencyKeyRequired:
+      name: Idempotency-Key
+      in: header
+      required: true
+      description: |
+        Client-chosen unique value for this request (a random UUID is a good choice). A retry with the
+        same key and body returns the first response and does not start a second run.
+      schema:
+        type: string
+        minLength: 1
+        maxLength: 255
+    SignatureHeader:
+      name: Sitewarm-Signature
+      in: header
+      required: true
+      description: '`t=<unix seconds>,v1=<hex HMAC-SHA256 of "<t>.<raw body>">`.'
+      schema:
+        type: string
+    SiteId:
+      name: siteId
+      in: path
+      required: true
+      schema:
+        type: string
+    SitemapId:
+      name: sitemapId
+      in: path
+      required: true
+      schema:
+        type: string
+    UrlSetId:
+      name: urlSetId
+      in: path
+      required: true
+      schema:
+        type: string
+    RunId:
+      name: runId
+      in: path
+      required: true
+      schema:
+        type: string
+    ReportId:
+      name: reportId
+      in: path
+      required: true
+      schema:
+        type: string
+    ScheduleId:
+      name: scheduleId
+      in: path
+      required: true
+      schema:
+        type: string
+    WebhookId:
+      name: webhookId
+      in: path
+      required: true
+      schema:
+        type: string
+    ApiKeyId:
+      name: apiKeyId
+      in: path
+      required: true
+      schema:
+        type: string
+  headers:
+    RateLimit-Limit:
+      description: Requests allowed in the current window.
+      schema:
+        type: integer
+    RateLimit-Remaining:
+      description: Requests left in the current window.
+      schema:
+        type: integer
+    RateLimit-Reset:
+      description: Seconds until the current window resets.
+      schema:
+        type: integer
+    RetryAfter:
+      description: Seconds to wait before polling or retrying.
+      schema:
+        type: integer
+        minimum: 0
+    Location:
+      description: URL of the created resource or of the status resource to poll.
+      schema:
+        type: string
+        format: uri-reference
+    IdempotentReplayed:
+      description: '`true` when this response replays the first response for the same Idempotency-Key.'
+      schema:
+        type: boolean
+  responses:
+    BadRequest:
+      description: The request is malformed (`invalid-request`, `idempotency-key-missing`).
+      headers:
+        RateLimit-Limit:
+          $ref: '#/components/headers/RateLimit-Limit'
+        RateLimit-Remaining:
+          $ref: '#/components/headers/RateLimit-Remaining'
+        RateLimit-Reset:
+          $ref: '#/components/headers/RateLimit-Reset'
+      content:
+        application/problem+json:
+          schema:
+            $ref: '#/components/schemas/Problem'
+    Unauthorized:
+      description: Missing, invalid, expired or revoked API key (`unauthorized`).
+      headers:
+        RateLimit-Limit:
+          $ref: '#/components/headers/RateLimit-Limit'
+        RateLimit-Remaining:
+          $ref: '#/components/headers/RateLimit-Remaining'
+        RateLimit-Reset:
+          $ref: '#/components/headers/RateLimit-Reset'
+      content:
+        application/problem+json:
+          schema:
+            $ref: '#/components/schemas/Problem'
+    Forbidden:
+      description: |
+        The key lacks the scope or is not allowed to use the site (`insufficient-scope`,
+        `scope-not-allowed`), or the organization is not entitled to the feature (`not-entitled`).
+      headers:
+        RateLimit-Limit:
+          $ref: '#/components/headers/RateLimit-Limit'
+        RateLimit-Remaining:
+          $ref: '#/components/headers/RateLimit-Remaining'
+        RateLimit-Reset:
+          $ref: '#/components/headers/RateLimit-Reset'
+      content:
+        application/problem+json:
+          schema:
+            $ref: '#/components/schemas/Problem'
+    NotFound:
+      description: The resource does not exist or belongs to another organization (`not-found`).
+      headers:
+        RateLimit-Limit:
+          $ref: '#/components/headers/RateLimit-Limit'
+        RateLimit-Remaining:
+          $ref: '#/components/headers/RateLimit-Remaining'
+        RateLimit-Reset:
+          $ref: '#/components/headers/RateLimit-Reset'
+      content:
+        application/problem+json:
+          schema:
+            $ref: '#/components/schemas/Problem'
+    Conflict:
+      description: |
+        The request conflicts with the current state (`conflict`, `idempotency-key-reused`,
+        `site-not-verified`, `site-paused`).
+      headers:
+        RateLimit-Limit:
+          $ref: '#/components/headers/RateLimit-Limit'
+        RateLimit-Remaining:
+          $ref: '#/components/headers/RateLimit-Remaining'
+        RateLimit-Reset:
+          $ref: '#/components/headers/RateLimit-Reset'
+      content:
+        application/problem+json:
+          schema:
+            $ref: '#/components/schemas/Problem'
+    Unprocessable:
+      description: |
+        The body is well formed but not acceptable (`validation-failed`, `quota-exceeded`).
+      headers:
+        RateLimit-Limit:
+          $ref: '#/components/headers/RateLimit-Limit'
+        RateLimit-Remaining:
+          $ref: '#/components/headers/RateLimit-Remaining'
+        RateLimit-Reset:
+          $ref: '#/components/headers/RateLimit-Reset'
+      content:
+        application/problem+json:
+          schema:
+            $ref: '#/components/schemas/Problem'
+    InternalError:
+      description: |
+        Unexpected server error (`internal-error`). The body is a problem document with no detail: nothing about the
+        request, the data or the cause is echoed. Retrying is safe for reads; for `createWarmRun` retry with the
+        same `Idempotency-Key`.
+      content:
+        application/problem+json:
+          schema:
+            $ref: '#/components/schemas/Problem'
+    TooManyRequests:
+      description: Rate limit reached (`rate-limited`). Wait for `Retry-After` seconds.
+      headers:
+        RateLimit-Limit:
+          $ref: '#/components/headers/RateLimit-Limit'
+        RateLimit-Remaining:
+          $ref: '#/components/headers/RateLimit-Remaining'
+        RateLimit-Reset:
+          $ref: '#/components/headers/RateLimit-Reset'
+        Retry-After:
+          $ref: '#/components/headers/RetryAfter'
+      content:
+        application/problem+json:
+          schema:
+            $ref: '#/components/schemas/Problem'
+  schemas:
+    Problem:
+      type: object
+      description: RFC 9457 problem details.
+      required: [type, title, status]
+      properties:
+        type:
+          type: string
+          format: uri-reference
+          description: |
+            Identifies the problem type; one of `ProblemType`, as a URI reference such as
+            `/problems/site-not-verified`.
+          examples:
+            - /problems/site-not-verified
+        code:
+          $ref: '#/components/schemas/ProblemType'
+        title:
+          type: string
+        status:
+          type: integer
+        detail:
+          type: string
+        instance:
+          type: string
+          format: uri-reference
+        errors:
+          type: array
+          description: Field errors, present for `validation-failed` and `invalid-request`.
+          items:
+            type: object
+            required: [pointer, detail]
+            properties:
+              pointer:
+                type: string
+                description: JSON Pointer to the offending member.
+              detail:
+                type: string
+        limit:
+          type: string
+          description: For `quota-exceeded`, the name of the limit that was reached (for example `sites`).
+        plan:
+          type: string
+          description: For `quota-exceeded`, the organization's plan as an opaque label.
+      additionalProperties: true
+    ProblemType:
+      type: string
+      description: Documented problem type slugs. Clients must tolerate new values.
+      enum:
+        - invalid-request
+        - validation-failed
+        - idempotency-key-missing
+        - idempotency-key-reused
+        - unauthorized
+        - insufficient-scope
+        - scope-not-allowed
+        - not-entitled
+        - not-found
+        - conflict
+        - site-not-verified
+        - site-paused
+        - quota-exceeded
+        - rate-limited
+        - internal-error
+    PageInfo:
+      type: object
+      required: [has_more, next_cursor]
+      properties:
+        has_more:
+          type: boolean
+        next_cursor:
+          type: [string, 'null']
+          description: Cursor for the next page; null on the last page.
+    Scope:
+      type: string
+      enum:
+        - sites:read
+        - sites:write
+        - warm-runs:read
+        - warm-runs:write
+        - cache-reports:read
+        - schedules:read
+        - schedules:write
+        - webhooks:read
+        - webhooks:write
+        - api-keys:read
+        - api-keys:write
+    CacheState:
+      type: string
+      description: |
+        Normalized cache status of one URL and profile at one vantage point, exactly the engine states.
+        `unknown` means the CDN does not expose a status (see `unknown_reason`). Clients must tolerate
+        new values.
+      enum:
+        - hit
+        - stale
+        - miss
+        - bypass
+        - variant-unverifiable
+        - challenged
+        - client-error
+        - redirect-error
+        - error
+        - incomplete
+        - unknown
+        - skipped-robots
+        - stale-revision
+        - expected
+        - unexpected
+    FailOnToken:
+      description: |
+        A value accepted by the engine's `--fail-on`: any cache state, or an indexability token.
+        `noindex` also fails on `indexability-error`.
+      anyOf:
+        - $ref: '#/components/schemas/CacheState'
+        - type: string
+          enum:
+            - noindex
+            - indexability-inconclusive
+    UnknownReason:
+      type: string
+      description: |
+        Why a state is `unknown`.
+
+      enum:
+        - cdn-hidden
+        - region-unavailable
+    Indexability:
+      type: object
+      description: Indexability is separate from the cache state.
+      properties:
+        finding:
+          type: [string, 'null']
+          enum: [noindex, indexability-error, indexability-inconclusive, null]
+          description: The engine's finding; null when none was reported.
+        meta_robots:
+          type: [string, 'null']
+        x_robots_tag:
+          type: [string, 'null']
+        canonical:
+          type: [string, 'null']
+    RunStatus:
+      type: string
+      description: |
+        Lifecycle of a run. Whether the run passed is `outcome`, not the status. `failed` means the
+        run itself broke (see `error_code`); it is never a verdict about the site.
+
+      enum: [queued, running, completed, canceled, failed]
+    TriggerType:
+      type: string
+      enum: [api, schedule, panel]
+    Trigger:
+      type: object
+      required: [type]
+      properties:
+        type:
+          $ref: '#/components/schemas/TriggerType'
+        schedule_id:
+          type: [string, 'null']
+        api_key_id:
+          type: [string, 'null']
+    Deployment:
+      type: object
+      description: Context of the deploy that caused the run, echoed to the results and webhooks.
+      properties:
+        id:
+          type: string
+        environment:
+          type: string
+        ref:
+          type: string
+          description: Commit SHA, tag or other revision label.
+    Site:
+      type: object
+      required: [id, hostname, verification, created_at]
+      properties:
+        id:
+          type: string
+        hostname:
+          type: string
+          description: The site's hostname; apex and `www` are the same site.
+        verification:
+          type: object
+          description: Read-only. Verification is done outside this API.
+          required: [status]
+          properties:
+            status:
+              type: string
+              description: |
+                `verified` only while the proof is valid. A pending, expired or lapsed proof is
+                `unverified`.
+              enum: [unverified, verified]
+            verified_at:
+              type: [string, 'null']
+              format: date-time
+        paused:
+          type: boolean
+          description: |
+            Read-only here. A paused site gets no new jobs. Omitted until sites can be paused.
+
+        settings:
+          $ref: '#/components/schemas/SiteSettings'
+          description: Omitted until site settings are stored.
+        created_at:
+          type: string
+          format: date-time
+    SiteSettings:
+      type: object
+      properties:
+        device_variants:
+          type: boolean
+          description: |
+            The operator declares that the CDN segments the cache by device, so affected URLs are
+            reported `variant-unverifiable`.
+    SiteCreate:
+      type: object
+      required: [hostname]
+      properties:
+        hostname:
+          type: string
+        settings:
+          $ref: '#/components/schemas/SiteSettings'
+    SiteUpdate:
+      type: object
+      properties:
+        settings:
+          $ref: '#/components/schemas/SiteSettings'
+    SiteList:
+      type: object
+      required: [data, page]
+      properties:
+        data:
+          type: array
+          items:
+            $ref: '#/components/schemas/Site'
+        page:
+          $ref: '#/components/schemas/PageInfo'
+    Sitemap:
+      type: object
+      required: [id, site_id, url, created_at]
+      properties:
+        id:
+          type: string
+        site_id:
+          type: string
+        url:
+          type: string
+          format: uri
+        created_at:
+          type: string
+          format: date-time
+    SitemapCreate:
+      type: object
+      required: [url]
+      properties:
+        url:
+          type: string
+          format: uri
+    SitemapList:
+      type: object
+      required: [data, page]
+      properties:
+        data:
+          type: array
+          items:
+            $ref: '#/components/schemas/Sitemap'
+        page:
+          $ref: '#/components/schemas/PageInfo'
+    UrlSet:
+      type: object
+      required: [id, site_id, name, url_count, created_at]
+      properties:
+        id:
+          type: string
+        site_id:
+          type: string
+        name:
+          type: string
+        url_count:
+          type: integer
+          minimum: 0
+        urls:
+          type: array
+          description: The URLs in warming priority order. Returned by `getUrlSet`, omitted in lists.
+          items:
+            type: string
+            format: uri
+        created_at:
+          type: string
+          format: date-time
+    UrlSetWrite:
+      type: object
+      required: [name, urls]
+      properties:
+        name:
+          type: string
+        urls:
+          type: array
+          description: Absolute URLs on the site's hostname, in priority order.
+          items:
+            type: string
+            format: uri
+    UrlSetList:
+      type: object
+      required: [data, page]
+      properties:
+        data:
+          type: array
+          items:
+            $ref: '#/components/schemas/UrlSet'
+        page:
+          $ref: '#/components/schemas/PageInfo'
+    RunSourceSitemap:
+      type: object
+      required: [type, sitemap_id]
+      properties:
+        type:
+          const: sitemap
+        sitemap_id:
+          type: string
+    RunSourceUrlSet:
+      type: object
+      required: [type, url_set_id]
+      properties:
+        type:
+          const: url_set
+        url_set_id:
+          type: string
+    RunSource:
+      description: Exactly one source of URLs per run, as in the engine.
+      oneOf:
+        - $ref: '#/components/schemas/RunSourceSitemap'
+        - $ref: '#/components/schemas/RunSourceUrlSet'
+      discriminator:
+        propertyName: type
+        mapping:
+          sitemap: '#/components/schemas/RunSourceSitemap'
+          url_set: '#/components/schemas/RunSourceUrlSet'
+    RunOptions:
+      type: object
+      description: |
+        Engine options for a run. Every field is optional; an omitted field takes the engine or
+        organization default, which this document does not define.
+      properties:
+        top:
+          type: integer
+          minimum: 1
+          description: Use only the first N URLs of the source, in its order.
+        fail_on:
+          type: array
+          uniqueItems: true
+          description: |
+            Cache states and indexability tokens that make the run fail. Omitted means the engine
+            default. An empty array means nothing fails the run (the "no verification" rule still
+            applies).
+          items:
+            $ref: '#/components/schemas/FailOnToken'
+        expect_revision_header:
+          type: string
+          description: '`NAME=VALUE`. Each verified response must carry this revision, otherwise `stale-revision`.'
+          examples:
+            - X-Build-Id=0123abcd
+        wait_for_header:
+          type: string
+          description: '`NAME=VALUE`. Wait until the site serves this header before warming.'
+        wait_for_url:
+          type: string
+          format: uri
+          description: Wait until this URL is live (use with `expect_text`) before warming.
+        expect_text:
+          type: string
+        settle:
+          type: string
+          description: Fixed delay before warming, such as `30s`.
+        max_wait:
+          type: string
+          description: How long to retry a URL until it is a `hit`, such as `5m`.
+        run_timeout:
+          type: string
+          description: Cap for the whole run, such as `15m`. URLs left over become `incomplete`.
+        vantage_point_ids:
+          type: array
+          items:
+            type: string
+          description: |
+            Restrict the run to these vantage points. Omitted means all the organization may use.
+
+    EffectiveRunOptions:
+      type: object
+      description: |
+        The options of a run as accepted. `fail_on` is the list the run was created with, or the list
+        the engine reports it applied once known; it is null until then (no default is invented).
+      required: [fail_on]
+      properties:
+        top:
+          type: [integer, 'null']
+          minimum: 1
+        fail_on:
+          type: [array, 'null']
+          description: The list in effect, or null while the engine default is not yet reported.
+          items:
+            $ref: '#/components/schemas/FailOnToken'
+      additionalProperties: true
+    WarmRunCreate:
+      type: object
+      properties:
+        source:
+          $ref: '#/components/schemas/RunSource'
+        deployment:
+          $ref: '#/components/schemas/Deployment'
+        options:
+          $ref: '#/components/schemas/RunOptions'
+    Outcome:
+      type: object
+      description: Whether the run passes, by the `--fail-on` contract.
+      required: [failed, failing_states, reason]
+      properties:
+        failed:
+          type: boolean
+        failing_states:
+          type: array
+          description: Tokens from the effective `fail_on` that matched at least one result.
+          items:
+            $ref: '#/components/schemas/FailOnToken'
+        reason:
+          type: [string, 'null']
+          enum: [fail_on_matched, no_verifications, null]
+          description: |
+            `no_verifications`: no URL could be verified (for example all `skipped-robots`), which
+            fails the run even if `skipped-robots` is not in `fail_on`. Null when the run passed.
+    StateCounts:
+      type: object
+      description: Number of results per cache state. States with no results may be omitted.
+      propertyNames:
+        $ref: '#/components/schemas/CacheState'
+      additionalProperties:
+        type: integer
+        minimum: 0
+    VantagePointSummary:
+      type: object
+      required: [vantage_point_id, region, status, n, counts]
+      properties:
+        vantage_point_id:
+          type: string
+        region:
+          type: string
+        status:
+          $ref: '#/components/schemas/RunStatus'
+        n:
+          type: integer
+          minimum: 0
+          description: Number of results (URL by profile) for this vantage point.
+        counts:
+          $ref: '#/components/schemas/StateCounts'
+        unknown_reason:
+          oneOf:
+            - $ref: '#/components/schemas/UnknownReason'
+            - type: 'null'
+    WarmRun:
+      type: object
+      required: [id, site_id, status, trigger, options, outcome, vantage_points, created_at]
+      properties:
+        id:
+          type: string
+        site_id:
+          type: string
+        status:
+          $ref: '#/components/schemas/RunStatus'
+        trigger:
+          $ref: '#/components/schemas/Trigger'
+        deployment:
+          oneOf:
+            - $ref: '#/components/schemas/Deployment'
+            - type: 'null'
+        source:
+          $ref: '#/components/schemas/RunSource'
+        options:
+          $ref: '#/components/schemas/EffectiveRunOptions'
+        outcome:
+          oneOf:
+            - $ref: '#/components/schemas/Outcome'
+            - type: 'null'
+          description: Null until the run is `completed`.
+        vantage_points:
+          type: array
+          items:
+            $ref: '#/components/schemas/VantagePointSummary'
+        created_at:
+          type: string
+          format: date-time
+        started_at:
+          type: [string, 'null']
+          format: date-time
+        finished_at:
+          type: [string, 'null']
+          format: date-time
+        error_code:
+          type: [string, 'null']
+          description: A short code when `status` is `failed`; null otherwise.
+    WarmRunList:
+      type: object
+      required: [data, page]
+      properties:
+        data:
+          type: array
+          items:
+            $ref: '#/components/schemas/WarmRun'
+        page:
+          $ref: '#/components/schemas/PageInfo'
+    VantagePointRef:
+      type: object
+      required: [id, region]
+      properties:
+        id:
+          type: string
+        region:
+          type: string
+    Result:
+      type: object
+      description: |
+        What the engine observed for one URL and one profile at one vantage point. Fields marked
+        nullable depend on engine releases that may not be out yet.
+      required: [url, final_state]
+      properties:
+        url:
+          type: string
+          format: uri
+        profile:
+          type: [string, 'null']
+          description: Request profile name, for example `desktop` or `mobile`.
+        vantage_point:
+          oneOf:
+            - $ref: '#/components/schemas/VantagePointRef'
+            - type: 'null'
+        initial_state:
+          description: Omitted when the engine has not reported the first observation separately.
+          $ref: '#/components/schemas/CacheState'
+        final_state:
+          $ref: '#/components/schemas/CacheState'
+        unknown_reason:
+          oneOf:
+            - $ref: '#/components/schemas/UnknownReason'
+            - type: 'null'
+        http_status:
+          type: [integer, 'null']
+        cdn:
+          type: [string, 'null']
+          description: Detected CDN, for example `cloudflare`.
+        cdn_cache_header:
+          type: [string, 'null']
+          description: Raw cache status header value as observed (for example `EXPIRED`), never normalized.
+        pop:
+          type: [string, 'null']
+          description: Point of presence when the CDN exposes it.
+        time_to_hit_ms:
+          type: [integer, 'null']
+          minimum: 0
+        ttfb_ms:
+          type: [integer, 'null']
+          minimum: 0
+        cache_control:
+          type: [string, 'null']
+        age_seconds:
+          type: [integer, 'null']
+          minimum: 0
+        vary:
+          type: [string, 'null']
+        indexability:
+          oneOf:
+            - $ref: '#/components/schemas/Indexability'
+            - type: 'null'
+        route_group:
+          type: [string, 'null']
+          description: Route template the URL belongs to (for example `/blog/*`).
+        cause:
+          type: array
+          description: Engine-provided causes for a non-`hit` state, citing observed headers. `Set-Cookie` values are redacted.
+          items:
+            type: string
+        fix:
+          type: array
+          description: Engine-provided suggested fixes.
+          items:
+            type: string
+        error:
+          type: [string, 'null']
+    ResultList:
+      type: object
+      required: [data, page]
+      properties:
+        data:
+          type: array
+          items:
+            $ref: '#/components/schemas/Result'
+        page:
+          $ref: '#/components/schemas/PageInfo'
+    ReportCell:
+      type: object
+      description: Results of one route group at one vantage point. No percentage is given on purpose.
+      required: [route_group, vantage_point, n, counts]
+      properties:
+        route_group:
+          type: string
+        vantage_point:
+          $ref: '#/components/schemas/VantagePointRef'
+        n:
+          type: integer
+          minimum: 0
+          description: Number of results (URL by profile) in the cell.
+        counts:
+          $ref: '#/components/schemas/StateCounts'
+        unknown_reason:
+          oneOf:
+            - $ref: '#/components/schemas/UnknownReason'
+            - type: 'null'
+    CacheStatusReportSummary:
+      type: object
+      required: [id, site_id, warm_run_id, created_at]
+      properties:
+        id:
+          type: string
+        site_id:
+          type: string
+        warm_run_id:
+          type: string
+        created_at:
+          type: string
+          format: date-time
+    CacheStatusReport:
+      allOf:
+        - $ref: '#/components/schemas/CacheStatusReportSummary'
+        - type: object
+          required: [cells]
+          properties:
+            cells:
+              type: array
+              items:
+                $ref: '#/components/schemas/ReportCell'
+    CacheStatusReportList:
+      type: object
+      required: [data, page]
+      properties:
+        data:
+          type: array
+          items:
+            $ref: '#/components/schemas/CacheStatusReportSummary'
+        page:
+          $ref: '#/components/schemas/PageInfo'
+    Cadence:
+      type: object
+      description: Run every N hours or days. Allowed values depend on the organization's limits.
+      required: [unit, every]
+      properties:
+        unit:
+          type: string
+          enum: [hour, day]
+        every:
+          type: integer
+          minimum: 1
+    Schedule:
+      type: object
+      required: [id, site_id, enabled, cadence, source, options, created_at]
+      properties:
+        id:
+          type: string
+        site_id:
+          type: string
+        enabled:
+          type: boolean
+        cadence:
+          $ref: '#/components/schemas/Cadence'
+        source:
+          $ref: '#/components/schemas/RunSource'
+        options:
+          $ref: '#/components/schemas/RunOptions'
+        next_run_at:
+          type: [string, 'null']
+          format: date-time
+        last_run_id:
+          type: [string, 'null']
+        created_at:
+          type: string
+          format: date-time
+    ScheduleCreate:
+      type: object
+      required: [cadence, source]
+      properties:
+        enabled:
+          type: boolean
+        cadence:
+          $ref: '#/components/schemas/Cadence'
+        source:
+          $ref: '#/components/schemas/RunSource'
+        options:
+          $ref: '#/components/schemas/RunOptions'
+    ScheduleUpdate:
+      type: object
+      properties:
+        enabled:
+          type: boolean
+        cadence:
+          $ref: '#/components/schemas/Cadence'
+        source:
+          $ref: '#/components/schemas/RunSource'
+        options:
+          $ref: '#/components/schemas/RunOptions'
+    ScheduleList:
+      type: object
+      required: [data, page]
+      properties:
+        data:
+          type: array
+          items:
+            $ref: '#/components/schemas/Schedule'
+        page:
+          $ref: '#/components/schemas/PageInfo'
+    EventType:
+      type: string
+      description: Events a webhook endpoint can subscribe to.
+      enum:
+        - warm_run.completed
+        - warm_run.canceled
+        - site.verification_changed
+    Webhook:
+      type: object
+      required: [id, url, events, enabled, created_at]
+      properties:
+        id:
+          type: string
+        url:
+          type: string
+          format: uri
+          description: HTTPS endpoint that receives deliveries.
+        description:
+          type: [string, 'null']
+        events:
+          type: array
+          minItems: 1
+          items:
+            $ref: '#/components/schemas/EventType'
+        enabled:
+          type: boolean
+        created_at:
+          type: string
+          format: date-time
+    WebhookWithSecret:
+      allOf:
+        - $ref: '#/components/schemas/Webhook'
+        - type: object
+          required: [secret]
+          properties:
+            secret:
+              type: string
+              description: HMAC signing secret. Shown only in this response.
+    WebhookCreate:
+      type: object
+      required: [url, events]
+      properties:
+        url:
+          type: string
+          format: uri
+        description:
+          type: string
+        events:
+          type: array
+          minItems: 1
+          items:
+            $ref: '#/components/schemas/EventType'
+        enabled:
+          type: boolean
+    WebhookUpdate:
+      type: object
+      properties:
+        url:
+          type: string
+          format: uri
+        description:
+          type: string
+        events:
+          type: array
+          minItems: 1
+          items:
+            $ref: '#/components/schemas/EventType'
+        enabled:
+          type: boolean
+    WebhookList:
+      type: object
+      required: [data, page]
+      properties:
+        data:
+          type: array
+          items:
+            $ref: '#/components/schemas/Webhook'
+        page:
+          $ref: '#/components/schemas/PageInfo'
+    EventEnvelope:
+      type: object
+      required: [id, type, created_at]
+      properties:
+        id:
+          type: string
+          description: Unique per event. A redelivery of the same event keeps the id; use it to deduplicate.
+        type:
+          $ref: '#/components/schemas/EventType'
+        created_at:
+          type: string
+          format: date-time
+    WarmRunCompletedEvent:
+      allOf:
+        - $ref: '#/components/schemas/EventEnvelope'
+        - type: object
+          required: [data]
+          properties:
+            type:
+              const: warm_run.completed
+            data:
+              $ref: '#/components/schemas/WarmRun'
+    WarmRunCanceledEvent:
+      allOf:
+        - $ref: '#/components/schemas/EventEnvelope'
+        - type: object
+          required: [data]
+          properties:
+            type:
+              const: warm_run.canceled
+            data:
+              $ref: '#/components/schemas/WarmRun'
+    SiteVerificationChangedEvent:
+      allOf:
+        - $ref: '#/components/schemas/EventEnvelope'
+        - type: object
+          required: [data]
+          properties:
+            type:
+              const: site.verification_changed
+            data:
+              $ref: '#/components/schemas/Site'
+    ApiKey:
+      type: object
+      required: [id, name, prefix, scopes, created_at]
+      properties:
+        id:
+          type: string
+        name:
+          type: string
+        prefix:
+          type: string
+          description: First characters of the key, to recognize it. Not a secret.
+        scopes:
+          type: array
+          items:
+            $ref: '#/components/schemas/Scope'
+        site_ids:
+          type: [array, 'null']
+          description: |
+            If set, the key can only act on these sites. A site-restricted key cannot hold
+            `webhooks:*` or `api-keys:*`. Null means all sites of the organization.
+
+          items:
+            type: string
+        expires_at:
+          type: [string, 'null']
+          format: date-time
+        last_used_at:
+          type: [string, 'null']
+          format: date-time
+        created_at:
+          type: string
+          format: date-time
+    ApiKeyWithSecret:
+      allOf:
+        - $ref: '#/components/schemas/ApiKey'
+        - type: object
+          required: [secret]
+          properties:
+            secret:
+              type: string
+              description: The API key. Shown only in this response.
+    ApiKeyCreate:
+      type: object
+      required: [name, scopes]
+      properties:
+        name:
+          type: string
+        scopes:
+          type: array
+          minItems: 1
+          items:
+            $ref: '#/components/schemas/Scope'
+        site_ids:
+          type: [array, 'null']
+          items:
+            type: string
+        expires_at:
+          type: [string, 'null']
+          format: date-time
+    ApiKeyList:
+      type: object
+      required: [data, page]
+      properties:
+        data:
+          type: array
+          items:
+            $ref: '#/components/schemas/ApiKey'
+        page:
+          $ref: '#/components/schemas/PageInfo'
