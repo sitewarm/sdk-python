@@ -24,6 +24,14 @@ class SiteWarmResponseTooLargeError(SiteWarmError):
         self.limit = limit
 
 
+class SiteWarmDecodeError(SiteWarmError):
+    """A 2xx response body was not valid JSON (for example an HTML page from a proxy). Never includes the body."""
+
+    def __init__(self, status: int) -> None:
+        super().__init__(f"invalid JSON in {status} response")
+        self.status = status
+
+
 class SiteWarmApiError(SiteWarmError):
     """The API answered with a non-2xx status.
 

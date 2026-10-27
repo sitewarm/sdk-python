@@ -2,12 +2,14 @@
 
 Models for typing and validation live in ``sitewarm.models`` (generated from the OpenAPI spec).
 """
+from ._version import __version__
 from ._client import ApiResponse, AsyncSiteWarm, SiteWarm
 from ._errors import (
     SiteWarmApiError,
     SiteWarmAuthenticationError,
     SiteWarmConflictError,
     SiteWarmConnectionError,
+    SiteWarmDecodeError,
     SiteWarmError,
     SiteWarmNotFoundError,
     SiteWarmPermissionError,
@@ -19,11 +21,11 @@ from ._errors import (
     SiteWarmWaitTimeoutError,
 )
 
-__version__ = "0.1.0"
 
 __all__ = [
+    "__version__",
     "ApiResponse", "AsyncSiteWarm", "SiteWarm", "SiteWarmApiError", "SiteWarmAuthenticationError",
-    "SiteWarmConflictError", "SiteWarmConnectionError", "SiteWarmError", "SiteWarmNotFoundError",
+    "SiteWarmConflictError", "SiteWarmConnectionError", "SiteWarmDecodeError", "SiteWarmError", "SiteWarmNotFoundError",
     "SiteWarmPermissionError", "SiteWarmRateLimitError", "SiteWarmResponseTooLargeError", "SiteWarmServerError", "SiteWarmTimeoutError",
     "SiteWarmValidationError", "SiteWarmWaitTimeoutError",
 ]

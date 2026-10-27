@@ -2,7 +2,10 @@ from __future__ import annotations
 
 import asyncio
 import json
+import random
 import re
+import socket
+import ssl
 import time
 import uuid
 from dataclasses import dataclass, field
@@ -13,6 +16,7 @@ import httpx
 
 from ._errors import (
     SiteWarmConnectionError,
+    SiteWarmDecodeError,
     SiteWarmError,
     SiteWarmResponseTooLargeError,
     SiteWarmTimeoutError,
@@ -21,12 +25,14 @@ from ._errors import (
 )
 from ._generated.operations import OPERATIONS
 from ._retry import backoff_delay, parse_retry_after
+from ._version import __version__
 
 _LOOPBACK = {"localhost", "127.0.0.1", "::1"}
 _TERMINAL = {"completed", "canceled", "failed"}
 _MAX_BODY = 32 << 20  # largest response body that is read (32 MiB)
 _REPEATABLE = {"GET", "HEAD", "PUT", "OPTIONS"}
 _MAX_PAGES = 10_000
+_DEFAULT_USER_AGENT = f"sitewarm-python/{__version__} (+https://github.com/sitewarm/sdk-python)"
 
 
 class _Secret:
@@ -71,6 +77,7 @@ class _Prepared:
     # 429 means "not processed". 5xx, network errors and broken bodies may have been, so they are only retried
     # when repeating is safe: GET, HEAD, PUT, OPTIONS, or a POST carrying an Idempotency-Key. Never DELETE/PATCH.
     retry_ambiguous: bool
+    sends_key: bool = False
 
 
 class _Core:
@@ -95,7 +102,7 @@ class _Core:
         self._retry_base = retry_base_delay
         self._retry_max = max_retry_delay
         self._timeout = float(timeout) if _is_num(timeout) and timeout > 0 else 30.0
-        self._user_agent = user_agent or "sitewarm-python"
+        self._user_agent = user_agent or _DEFAULT_USER_AGENT
 
     def __repr__(self) -> str:  # the key is never part of repr or str
         return f"{type(self).__name__}(base_url={self._base_url!r})"
@@ -128,7 +135,7 @@ class _Core:
         if sends_key:
             # One key per call, reused by every retry, so a retried POST never starts a second run.
             headers["Idempotency-Key"] = idempotency_key or str(uuid.uuid4())
-        return _Prepared(op.method, url, headers, content, op.method in _REPEATABLE or sends_key)
+        return _Prepared(op.method, url, headers, content, op.method in _REPEATABLE or sends_key, sends_key)
 
     def _decide(self, resp: httpx.Response, attempt: int, p: _Prepared) -> Union[ApiResponse, float]:
         """Returns the response to hand back, or the seconds to wait before retrying. Raises on errors."""
@@ -136,21 +143,51 @@ class _Core:
             return ApiResponse(_parse_body(resp), resp.status_code, resp.headers)
         retry_after = parse_retry_after(resp.headers.get("Retry-After"))
         status = resp.status_code
+        err = api_error_for(status, _parse_problem(resp), retry_after, _rate_limit(resp.headers))
         retryable = status == 429 or (status >= 500 and status != 501 and p.retry_ambiguous)
+        # A 409 "conflict" on a keyed POST is the original request still running (a timeout retry racing it).
+        # "idempotency-key-reused" is a caller bug and is never retried.
+        if status == 409 and p.sends_key and err.code == "conflict":
+            retryable = True
         if retryable and attempt < self._max_retries:
-            # A server-provided wait longer than we are willing to sleep is surfaced instead of ignored.
-            wait = retry_after if retry_after is not None else backoff_delay(attempt, self._retry_base, self._retry_max)
-            if wait <= self._retry_max:
-                return float(wait)
-        raise api_error_for(status, _parse_problem(resp), retry_after, _rate_limit(resp.headers))
+            if retry_after is not None:
+                # Never a hot retry on "Retry-After: 0" or a date in the past; jitter spreads clients out.
+                # A server-provided wait longer than the cap is surfaced instead of slept.
+                wait = max(float(retry_after), self._retry_base)
+                if wait <= self._retry_max:
+                    return wait * (1 + random.random() / 4)
+            else:
+                wait = backoff_delay(attempt, self._retry_base, self._retry_max)
+                if wait <= self._retry_max:
+                    return float(wait)
+        raise err
 
     def _transport_error(self, err: Exception, attempt: int, p: _Prepared, status: Optional[int] = None) -> float:
         # status is set when the failure happened while reading the body: after a 429 nothing was processed.
-        if attempt < self._max_retries and (p.retry_ambiguous or status == 429):
+        if attempt < self._max_retries and (p.retry_ambiguous or status == 429) and _transient(err):
             return backoff_delay(attempt, self._retry_base, self._retry_max)
         if isinstance(err, httpx.TimeoutException):
             raise SiteWarmTimeoutError(f"request timed out after {self._timeout} s") from err
         raise SiteWarmConnectionError(f"request failed: {type(err).__name__}") from err
+
+
+def _transient(err: BaseException) -> bool:
+    """False for failures that repeating cannot fix: certificate/TLS verification, unknown host, malformed request."""
+    if isinstance(err, (httpx.UnsupportedProtocol, httpx.LocalProtocolError)):
+        return False
+    seen: set[int] = set()
+    cur: Optional[BaseException] = err
+    while cur is not None and id(cur) not in seen:
+        seen.add(id(cur))
+        if isinstance(cur, ssl.SSLCertVerificationError):
+            return False
+        if isinstance(cur, socket.gaierror) and cur.errno in _DNS_NOT_FOUND:
+            return False
+        cur = cur.__cause__ or cur.__context__
+    return True
+
+
+_DNS_NOT_FOUND = {getattr(socket, n) for n in ("EAI_NONAME", "EAI_NODATA") if hasattr(socket, n)}
 
 
 class SiteWarm(_Core):
@@ -478,7 +515,7 @@ def _parse_body(resp: httpx.Response) -> Any:
     try:
         return resp.json()
     except ValueError:
-        raise SiteWarmError(f"invalid JSON in {resp.status_code} response") from None
+        raise SiteWarmDecodeError(resp.status_code) from None
 
 
 def _parse_problem(resp: httpx.Response) -> dict[str, Any]:
